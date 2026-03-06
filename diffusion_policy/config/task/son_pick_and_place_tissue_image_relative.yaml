@@ -1,0 +1,86 @@
+name: son_pick_and_place_tissue_image_relative
+
+camera_obs_latency: 0.125
+robot_obs_latency: 0.0001
+gripper_obs_latency: 0.02
+dataset_frequeny: 0 #59.94
+obs_down_sample_steps: 3 # 3, 1
+
+low_dim_obs_horizon: 2
+img_obs_horizon: 2
+action_horizon: 16
+ignore_proprioception: False
+
+image_shape: [3, 240, 320]
+dataset_path: /media/son/son_dataset_2/IL/dataset/rb10_pick_and_place/pick_tissue_all.hdf5
+
+shape_meta: &shape_meta
+  # acceptable types: rgb, low_dim
+  obs:
+    image0: # wrist view
+      shape: [3, 240, 320]
+      horizon: ${task.img_obs_horizon}
+      latency_steps: 0 # float
+      type: rgb
+      ignore_by_policy: False
+
+    image1: # global view
+      shape: [3, 240, 320]
+      horizon: ${task.img_obs_horizon}
+      latency_steps: 0 # float
+      type: rgb
+      ignore_by_policy: False
+
+    position:
+      shape: [3]
+      horizon: ${task.low_dim_obs_horizon}
+      # latency_steps: ${eval:'(${task.camera_obs_latency} - ${task.robot_obs_latency}) * ${task.dataset_frequeny}'} # float
+      type: low_dim
+      ignore_by_policy: ${task.ignore_proprioception}
+
+    quat:
+      # convert_robomimic_to_replay에서 raw_shape으로 확인됨
+      raw_shape: [4]
+      # 실제 학습, 추론에서는 observation으로 rotation_6d로 변환되어 사용됨
+      shape: [6]
+      horizon: ${task.low_dim_obs_horizon}
+      # latency_steps: ${eval:'(${task.camera_obs_latency} - ${task.robot_obs_latency}) * ${task.dataset_frequeny}'} # float
+      type: low_dim
+      rotation_rep: rotation_6d
+      ignore_by_policy: ${task.ignore_proprioception}
+
+    gripper:
+      shape: [1]
+      horizon: ${task.low_dim_obs_horizon}
+      # latency_steps: ${eval:'(${task.camera_obs_latency} - ${task.gripper_obs_latency}) * ${task.dataset_frequeny}'} # float
+      type: low_dim
+      ignore_by_policy: ${task.ignore_proprioception}
+
+  action:
+    shape: [10] # 3 (pos) + 6 (rot 6d) + 1 (gripper)
+    horizon: ${task.action_horizon}
+    rotation_rep: rotation_6d
+
+# 정리하면, & 뒤에 나오는 이름 = 나중에 *이름으로 참조할 때 쓰는 변수 이름이라고 보면 됩니다.
+task_name: &task_name son_pick_and_place_tissue_image_relative
+
+pose_repr: &pose_repr
+  obs_pose_repr: abs   # abs or relative
+  action_pose_repr: relative  # abs or relative or delta
+  action_gripper_repr: abs  # abs: 절대값 유지, relative: 현재 obs gripper 기준 delta 사용
+
+env_runner:
+  _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
+
+dataset:
+  _target_: diffusion_policy.dataset.son_replay_image_dataset_relative.SonReplayImageDatasetRelative
+  shape_meta: *shape_meta
+  dataset_path: ${task.dataset_path}
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  n_obs_steps: ${dataset_obs_steps}
+  use_cache: True
+  pose_repr: *pose_repr
+  seed: 42
+  val_ratio: 0.00

@@ -10,28 +10,23 @@ def create_indices(
     episode_mask: np.ndarray,
     pad_before: int=0, pad_after: int=0,
     debug:bool=True) -> np.ndarray:
-    assert episode_mask.shape == episode_ends.shape      
-    # 0 < pad < sequence_length  
+    episode_mask.shape == episode_ends.shape        
     pad_before = min(max(pad_before, 0), sequence_length-1)
     pad_after = min(max(pad_after, 0), sequence_length-1)
 
     indices = list()
     for i in range(len(episode_ends)):
-        # False면 그냥 Pass
         if not episode_mask[i]:
             # skip episode
             continue
-        # 0번째 episode면 start_idx 따로 지정
         start_idx = 0
         if i > 0:
             start_idx = episode_ends[i-1]
         end_idx = episode_ends[i]
-        # episode 길이
         episode_length = end_idx - start_idx
         
-        # episode_length : 실제 episode 길이 / sequence_length : 학습할때 episode 길이
-        min_start = -pad_before 
-        max_start = episode_length - sequence_length + pad_after 
+        min_start = -pad_before
+        max_start = episode_length - sequence_length + pad_after
         
         # range stops one idx before end
         for idx in range(min_start, max_start+1):
@@ -44,10 +39,7 @@ def create_indices(
             if debug:
                 assert(start_offset >= 0)
                 assert(end_offset >= 0)
-                # 사용하는 실제 sequence 수 (padding 제외된)
                 assert (sample_end_idx - sample_start_idx) == (buffer_end_idx - buffer_start_idx)
-                # buffer_start_idx, buffer_end_idx : 실제 episode에서 사용할 범위
-                # sample_start_idx, sample_end_idx : 앞의 패딩수, sequence에서 뒤의 패딩수 제외
             indices.append([
                 buffer_start_idx, buffer_end_idx, 
                 sample_start_idx, sample_end_idx])
@@ -126,6 +118,7 @@ class SequenceSampler:
         self.sequence_length = sequence_length
         self.replay_buffer = replay_buffer
         self.key_first_k = key_first_k
+        self.ignore_rgb_is_applied = False # speed up the interation when getting normalizaer
     
     def __len__(self):
         return len(self.indices)
@@ -135,6 +128,8 @@ class SequenceSampler:
             = self.indices[idx]
         result = dict()
         for key in self.keys:
+            if self.ignore_rgb_is_applied and 'image' in key:
+                continue
             input_arr = self.replay_buffer[key]
             # performance optimization, avoid small allocation if possible
             if key not in self.key_first_k:
@@ -163,3 +158,6 @@ class SequenceSampler:
                 data[sample_start_idx:sample_end_idx] = sample
             result[key] = data
         return result
+
+    def ignore_rgb(self, apply=True):
+        self.ignore_rgb_is_applied = apply
