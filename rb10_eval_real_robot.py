@@ -41,8 +41,11 @@ from diffusion_policy.real_world.rb10_real_env import RealEnv   # 새로 만듬
 # from diffusion_policy.real_world.spacemouse_shared_memory import Spacemouse
 from diffusion_policy.common.precise_sleep import precise_wait
 from diffusion_policy.real_world.real_inference_util import (
-    get_real_obs_resolution, 
-    get_real_obs_dict)
+    get_real_obs_resolution,
+    get_real_obs_dict,
+    get_real_relative_obs_dict,
+    get_real_relative_action)
+from diffusion_policy.model.common.rotation_transformer_rel import RotationTransformer
 from diffusion_policy.common.pytorch_util import dict_apply
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
@@ -104,6 +107,26 @@ def main(input, output, robot_ip, match_dataset, match_episode,
     # setup experiment
     dt = 1/frequency
 
+    # pose_repr 설정 (없으면 모두 abs로 처리)
+    from omegaconf import OmegaConf
+    _pose_repr = OmegaConf.to_container(cfg.task.get('pose_repr', {}), resolve=True)
+    obs_pose_repr = _pose_repr.get('obs_pose_repr', 'abs')
+    action_pose_repr = _pose_repr.get('action_pose_repr', 'abs')
+    action_gripper_repr = _pose_repr.get('action_gripper_repr', 'abs')
+    print("obs_pose_repr:", obs_pose_repr)
+    print("action_pose_repr:", action_pose_repr)
+    print("action_gripper_repr:", action_gripper_repr)
+
+    # RotationTransformer 초기화
+    rot_quat2mat = RotationTransformer('quaternion', 'matrix')
+    rot_6d2mat   = RotationTransformer('rotation_6d', 'matrix')
+    rot_mat2target = {}
+    for key, attr in cfg.task.shape_meta['obs'].items():
+        if 'rotation_rep' in attr:
+            rot_mat2target[key] = RotationTransformer('matrix', attr['rotation_rep'])
+    rot_mat2target['action'] = RotationTransformer(
+        'matrix', cfg.task.shape_meta['action']['rotation_rep'])
+
     obs_res = get_real_obs_resolution(cfg.task.shape_meta)   # obs의 image 해상도 (width, height)
     n_obs_steps = cfg.n_obs_steps   # obs 관측 step 수
     print("n_obs_steps: ", n_obs_steps)   # obs 관측 step수 (2)
@@ -150,9 +173,15 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                 policy.reset()
 
                 # 받은 obs에서 image 정규화 및 다듬기, pose 다듬기
-                obs_dict_np = get_real_obs_dict(
-                    env_obs=obs, shape_meta=cfg.task.shape_meta)
-                
+                if obs_pose_repr == 'relative':
+                    obs_dict_np = get_real_relative_obs_dict(
+                        env_obs=obs, shape_meta=cfg.task.shape_meta,
+                        rot_quat2mat=rot_quat2mat, rot_mat2target=rot_mat2target,
+                        obs_pose_repr=obs_pose_repr)
+                else:
+                    obs_dict_np = get_real_obs_dict(
+                        env_obs=obs, shape_meta=cfg.task.shape_meta)
+
                 # shape_meta 계층구조는 유지하면서 np --> tensor로 변환, 텐서 배치차원 추가
                 obs_dict = dict_apply(obs_dict_np, 
                     lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
@@ -161,6 +190,10 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                 result = policy.predict_action(obs_dict)   # {'action': ~ , 'action_pred': ~}
                 # 실제 실행할 action trajectory
                 action = result['action'][0].detach().to('cpu').numpy()   # [0]은 배치차원 제거, tensor --> np
+                # relative action → absolute action 변환 (abs/abs이면 no-op)
+                action = get_real_relative_action(
+                    action, obs, action_pose_repr, action_gripper_repr,
+                    rot_quat2mat, rot_6d2mat, rot_mat2target)
                 assert action.shape[-1] == 10   # action 차원: 3 pos + 6 rot + 1 gripper
                 del result
 
@@ -196,14 +229,24 @@ def main(input, output, robot_ip, match_dataset, match_episode,
                         # run inference; action 예측
                         with torch.no_grad():
                             s = time.time()
-                            obs_dict_np = get_real_obs_dict(
-                                env_obs=obs, shape_meta=cfg.task.shape_meta)
+                            if obs_pose_repr == 'relative':
+                                obs_dict_np = get_real_relative_obs_dict(
+                                    env_obs=obs, shape_meta=cfg.task.shape_meta,
+                                    rot_quat2mat=rot_quat2mat, rot_mat2target=rot_mat2target,
+                                    obs_pose_repr=obs_pose_repr)
+                            else:
+                                obs_dict_np = get_real_obs_dict(
+                                    env_obs=obs, shape_meta=cfg.task.shape_meta)
                             obs_dict = dict_apply(obs_dict_np, 
                                 lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
                             # action 예측 
                             result = policy.predict_action(obs_dict)
                             # this action starts from the first obs step
                             action = result['action'][0].detach().to('cpu').numpy()   # 실행할 action[Horizon, Action_Dim]
+                            # relative action → absolute action 변환 (abs/abs이면 no-op)
+                            action = get_real_relative_action(
+                                action, obs, action_pose_repr, action_gripper_repr,
+                                rot_quat2mat, rot_6d2mat, rot_mat2target)
                             print('Inference latency:', time.time() - s)
                        
                         # convert policy action to env actions
