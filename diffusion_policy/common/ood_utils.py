@@ -126,3 +126,56 @@ def normalize_ood_score(score: torch.Tensor, stats: Dict[str, float]) -> torch.T
     p95 = stats.get("p95", 1.0)
     denom = max(p95 - median, 1e-6)
     return torch.clamp((score - median) / denom, min=0.0)
+
+
+def compute_reference_distance_percentiles(
+    bank: torch.Tensor,
+    chunk_size: int = 2048,
+    sample_size: int = 2048,
+) -> torch.Tensor:
+    if bank.shape[0] < 2:
+        return torch.zeros((1,), device=bank.device, dtype=bank.dtype)
+
+    total = bank.shape[0]
+    if sample_size is None or sample_size <= 0 or sample_size >= total:
+        sample_indices = torch.arange(total, device=bank.device)
+    else:
+        sample_indices = torch.linspace(
+            0, total - 1, steps=sample_size, device=bank.device
+        ).round().long().unique()
+
+    distances = []
+    for start in range(0, sample_indices.shape[0], chunk_size):
+        query_indices = sample_indices[start:start + chunk_size]
+        q = bank[query_indices]
+        best = None
+        for bank_start in range(0, total, chunk_size):
+            b = bank[bank_start:bank_start + chunk_size]
+            dist = torch.cdist(q, b, p=2)
+
+            relative_indices = query_indices - bank_start
+            valid_self = (relative_indices >= 0) & (relative_indices < b.shape[0])
+            if torch.any(valid_self):
+                row_idx = torch.nonzero(valid_self, as_tuple=False).squeeze(-1)
+                col_idx = relative_indices[valid_self]
+                dist[row_idx, col_idx] = float("inf")
+
+            min_dist = dist.min(dim=-1).values
+            if best is None:
+                best = min_dist
+            else:
+                best = torch.minimum(best, min_dist)
+        distances.append(best)
+
+    return torch.sort(torch.cat(distances, dim=0)).values
+
+
+def percentile_rank(score: torch.Tensor, reference_distances: torch.Tensor) -> torch.Tensor:
+    if reference_distances.numel() == 0:
+        return torch.zeros_like(score)
+
+    flattened = score.reshape(-1)
+    ranks = torch.searchsorted(reference_distances, flattened, right=True)
+    percentile = 100.0 * ranks.to(dtype=flattened.dtype) / reference_distances.numel()
+    percentile = torch.clamp(percentile, 0.0, 100.0)
+    return percentile.reshape(score.shape)

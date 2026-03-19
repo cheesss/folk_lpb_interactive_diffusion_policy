@@ -147,152 +147,230 @@ def _validate_obs_dict_np(obs_dict_np, shape_meta):
             raise RuntimeError(f"Unsupported obs type in shape_meta: {expected_type}")
 
 
-def _draw_metric_plot(values, width, height, title, color, threshold=None):
-    canvas = np.full((height, width, 3), 255, dtype=np.uint8)
-    margin = 32
-    x0, y0 = margin, margin
-    x1, y1 = width - margin, height - margin
-    cv2.rectangle(canvas, (x0, y0), (x1, y1), (30, 30, 30), 1)
+def _compute_plot_bounds(values, min_span=0.15, padding_ratio=0.2):
+    if len(values) == 0:
+        return 0.0, 1.0
 
-    y_max = 1.2
-    if len(values) > 0:
-        y_max = max(y_max, float(np.max(values)) * 1.15)
-    if threshold is not None:
-        y_max = max(y_max, threshold * 1.2)
-    y_max = max(y_max, 1e-6)
+    values_np = np.asarray(values, dtype=np.float32)
+    y_min = float(values_np.min())
+    y_max = float(values_np.max())
+    span = max(y_max - y_min, float(min_span))
+    pad = span * float(padding_ratio)
+    center = 0.5 * (y_min + y_max)
+    lower = center - 0.5 * span - pad
+    upper = center + 0.5 * span + pad
+    if upper <= lower + 1e-6:
+        upper = lower + 1.0
+    return lower, upper
 
-    tick_values = np.linspace(0.0, y_max, num=5)
+
+def _compute_bound_series(values):
+    lower_series = []
+    upper_series = []
+    for idx in range(1, len(values) + 1):
+        lower, upper = _compute_plot_bounds(values[:idx])
+        lower_series.append(lower)
+        upper_series.append(upper)
+    return lower_series, upper_series
+
+
+def _draw_polyline(canvas, values, x0, y0, x1, y1, y_min, y_span, color, thickness):
+    if len(values) < 2:
+        return
+    xs = np.linspace(x0, x1, num=len(values))
+    ys = []
+    for value in values:
+        t = np.clip((value - y_min) / y_span, 0.0, 1.0)
+        ys.append(y1 - t * (y1 - y0))
+    pts = np.stack([xs, ys], axis=1).astype(np.int32)
+    cv2.polylines(canvas, [pts], isClosed=False, color=color, thickness=thickness, lineType=cv2.LINE_AA)
+
+
+def _downsample_series(values, max_points):
+    if max_points <= 0 or len(values) <= max_points:
+        return list(values)
+    indices = np.linspace(0, len(values) - 1, num=max_points).round().astype(np.int64)
+    indices = np.unique(indices)
+    return [values[idx] for idx in indices]
+
+
+def _draw_metric_plot(values, width, height, color):
+    canvas = np.full((height, width, 3), 245, dtype=np.uint8)
+    outer_margin = 16
+    x0 = outer_margin
+    y0 = outer_margin
+    x1 = width - outer_margin - 1
+    y1 = height - outer_margin - 1
+
+    cv2.rectangle(canvas, (x0, y0), (x1, y1), (205, 212, 220), 1)
+    y_min, y_max = _compute_plot_bounds(values)
+    y_span = max(y_max - y_min, 1e-6)
+    lower_series, upper_series = _compute_bound_series(values)
+
+    tick_values = np.linspace(y_min, y_max, num=5)
     for tick in tick_values:
-        y_tick = int(y1 - (tick / y_max) * (y1 - y0))
-        cv2.line(canvas, (x0, y_tick), (x1, y_tick), (225, 225, 225), 1, cv2.LINE_AA)
-        cv2.putText(
-            canvas,
-            f"{tick:.1f}",
-            (4, y_tick + 4),
-            fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-            fontScale=0.42,
-            color=(80, 80, 80),
-            thickness=1,
-            lineType=cv2.LINE_AA,
-        )
+        y_tick = int(y1 - ((tick - y_min) / y_span) * (y1 - y0))
+        cv2.line(canvas, (x0, y_tick), (x1, y_tick), (228, 232, 236), 1, cv2.LINE_AA)
+
+    _draw_polyline(
+        canvas=canvas,
+        values=upper_series,
+        x0=x0,
+        y0=y0,
+        x1=x1,
+        y1=y1,
+        y_min=y_min,
+        y_span=y_span,
+        color=(0, 0, 255),
+        thickness=1,
+    )
+    _draw_polyline(
+        canvas=canvas,
+        values=lower_series,
+        x0=x0,
+        y0=y0,
+        x1=x1,
+        y1=y1,
+        y_min=y_min,
+        y_span=y_span,
+        color=(255, 0, 0),
+        thickness=1,
+    )
 
     if len(values) >= 2:
         xs = np.linspace(x0, x1, num=len(values))
         ys = []
         for value in values:
-            t = np.clip(value / y_max, 0.0, 1.0)
+            t = np.clip((value - y_min) / y_span, 0.0, 1.0)
             ys.append(y1 - t * (y1 - y0))
         pts = np.stack([xs, ys], axis=1).astype(np.int32)
         cv2.polylines(canvas, [pts], isClosed=False, color=color, thickness=2, lineType=cv2.LINE_AA)
         cv2.circle(canvas, tuple(pts[-1]), 4, color, -1, cv2.LINE_AA)
+    elif len(values) == 1:
+        y_val = int(y1 - np.clip((values[0] - y_min) / y_span, 0.0, 1.0) * (y1 - y0))
+        cv2.circle(canvas, (x1, y_val), 4, color, -1, cv2.LINE_AA)
 
-    if threshold is not None:
-        threshold_y = y1 - np.clip(threshold / y_max, 0.0, 1.0) * (y1 - y0)
-        cv2.line(canvas, (x0, int(threshold_y)), (x1, int(threshold_y)), (0, 0, 255), 1, cv2.LINE_AA)
-        cv2.putText(
-            canvas,
-            f"thr={threshold:.2f}",
-            (x0 + 6, int(threshold_y) - 6),
-            fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-            fontScale=0.45,
-            color=(0, 0, 255),
-            thickness=1,
-            lineType=cv2.LINE_AA,
-        )
-
-    latest = values[-1] if len(values) > 0 else 0.0
-    cv2.putText(
-        canvas,
-        f"{title}: {latest:.2f}",
-        (x0, y0 - 6),
-        fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-        fontScale=0.5,
-        color=(0, 0, 0),
-        thickness=1,
-        lineType=cv2.LINE_AA,
-    )
-    cv2.putText(
-        canvas,
-        "old",
-        (x0, y1 + 18),
-        fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-        fontScale=0.42,
-        color=(80, 80, 80),
-        thickness=1,
-        lineType=cv2.LINE_AA,
-    )
-    cv2.putText(
-        canvas,
-        "now",
-        (x1 - 28, y1 + 18),
-        fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-        fontScale=0.42,
-        color=(80, 80, 80),
-        thickness=1,
-        lineType=cv2.LINE_AA,
-    )
     return canvas
 
 
-def _render_ood_panel(
+def _resize_keep_aspect(image, target_height):
+    src_h, src_w = image.shape[:2]
+    if src_h == target_height:
+        return image
+    target_width = max(1, int(round(src_w * (target_height / src_h))))
+    return cv2.resize(image, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+
+
+def _render_ood_dashboard(
     frame_bgr,
     current_series,
     predicted_series,
     current_score,
     predicted_score,
-    threshold,
-    mode="policy",
+    recent_window,
 ):
-    frame = frame_bgr.copy()
-    border_color = (0, 0, 255) if current_score >= threshold else (40, 160, 40)
-    cv2.rectangle(frame, (0, 0), (frame.shape[1] - 1, frame.shape[0] - 1), border_color, 4)
+    dashboard_height = 760
+    border_color = (180, 180, 180)
+    panel_width = 1280
+    panel = np.full((dashboard_height, panel_width, 3), 248, dtype=np.uint8)
+    cv2.rectangle(panel, (0, 0), (panel_width - 1, dashboard_height - 1), border_color, 2)
 
-    panel_width = max(320, frame.shape[1] // 2)
-    header_height = 96
-    body_height = frame.shape[0] - header_height
-    half_body = body_height // 2
+    card_x = 18
+    card_w = panel_width - 2 * card_x
+    plot_margin_y = 18
+    score_h = 22
+    plot_gap = 14
+    full_plot_h = 430
+    recent_plot_h = dashboard_height - 2 * plot_margin_y - score_h - plot_gap - full_plot_h
+    full_series = _downsample_series(current_series, max(2, card_w - 32))
+    recent_series = current_series[-recent_window:] if recent_window > 0 else current_series
 
-    header = np.full((header_height, panel_width, 3), 248, dtype=np.uint8)
-    curr_alert = "ALERT" if current_score >= threshold else "OK"
-    pred_text = f"{predicted_score:.2f}" if predicted_score is not None else "N/A"
-    lines = [
-        f"mode: {mode}",
-        f"current_ood: {current_score:.2f} ({curr_alert})",
-        f"predicted_ood: {pred_text}",
-        f"threshold: {threshold:.2f}",
-    ]
-    y = 24
-    for line in lines:
-        cv2.putText(
-            header,
-            line,
-            (14, y),
-            fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-            fontScale=0.58,
-            color=(0, 0, 0),
-            thickness=1,
-            lineType=cv2.LINE_AA,
-        )
-        y += 21
-
-    current_plot = _draw_metric_plot(
-        current_series,
-        panel_width,
-        half_body,
-        title="current_ood",
+    full_plot = _draw_metric_plot(
+        full_series,
+        card_w,
+        full_plot_h,
         color=(0, 120, 255),
-        threshold=threshold,
     )
-    predicted_plot = _draw_metric_plot(
-        predicted_series if len(predicted_series) > 0 else [0.0],
-        panel_width,
-        frame.shape[0] - header_height - half_body,
-        title="predicted_ood",
-        color=(50, 50, 220),
-        threshold=threshold,
+    recent_plot = _draw_metric_plot(
+        recent_series,
+        card_w,
+        recent_plot_h,
+        color=(0, 120, 255),
     )
-    panel = np.vstack([header, current_plot, predicted_plot])
-    return np.concatenate([frame, panel], axis=1)
+    full_y0 = plot_margin_y
+    recent_y0 = full_y0 + full_plot_h + plot_gap
+    panel[full_y0:full_y0 + full_plot_h, card_x:card_x + card_w] = full_plot
+    panel[recent_y0:recent_y0 + recent_plot_h, card_x:card_x + card_w] = recent_plot
+
+    score_text = f"{current_score:.3f}"
+    score_size, _ = cv2.getTextSize(
+        score_text,
+        fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+        fontScale=0.5,
+        thickness=1,
+    )
+    score_x = card_x + (card_w - score_size[0]) // 2
+    score_y = recent_y0 + recent_plot_h + score_size[1]
+    cv2.putText(
+        panel,
+        score_text,
+        (score_x, score_y),
+        fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+        fontScale=0.5,
+        color=(120, 120, 120),
+        thickness=1,
+        lineType=cv2.LINE_AA,
+    )
+
+    return panel
+
+
+def _compose_ood_recording_frame(wrist_frame_bgr, graph_panel_bgr):
+    target_height = graph_panel_bgr.shape[0]
+    wrist_panel = _resize_keep_aspect(wrist_frame_bgr, target_height)
+    border_color = (180, 180, 180)
+    cv2.rectangle(
+        wrist_panel,
+        (0, 0),
+        (wrist_panel.shape[1] - 1, wrist_panel.shape[0] - 1),
+        border_color,
+        2,
+    )
+
+    gap = 16
+    out_width = wrist_panel.shape[1] + gap + graph_panel_bgr.shape[1]
+    out = np.full((target_height, out_width, 3), 248, dtype=np.uint8)
+    out[:, :wrist_panel.shape[1]] = wrist_panel
+    out[:, wrist_panel.shape[1] + gap:] = graph_panel_bgr
+    return out
+
+
+_WINDOW_LAYOUT_READY = {}
+
+
+def _show_dashboard_window(window_name, frame_bgr, anchor_window="Multi Cam Vis"):
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.imshow(window_name, frame_bgr)
+
+    frame_h, frame_w = frame_bgr.shape[:2]
+    cv2.resizeWindow(window_name, frame_w, frame_h)
+
+    if _WINDOW_LAYOUT_READY.get(window_name):
+        return
+
+    anchored = False
+    try:
+        anchor_x, anchor_y, anchor_w, _ = cv2.getWindowImageRect(anchor_window)
+        if anchor_w > 0:
+            cv2.moveWindow(window_name, anchor_x + anchor_w + 24, anchor_y)
+            anchored = True
+    except cv2.error:
+        pass
+
+    if not anchored:
+        cv2.moveWindow(window_name, 920, 60)
+
+    _WINDOW_LAYOUT_READY[window_name] = True
 
 
 def _write_ood_video(out_path, frames_bgr, fps):
@@ -437,6 +515,7 @@ def main(
     if vis_camera_idx >= len(rgb_keys):
         raise RuntimeError("vis_camera_idx out of range for RGB keys")
     vis_rgb_key = rgb_keys[vis_camera_idx]
+    wrist_rgb_key = "image0" if "image0" in rgb_keys else vis_rgb_key
     episode_idx = 0
 
     with SharedMemoryManager() as shm_manager:
@@ -499,10 +578,10 @@ def main(
 
             print("Ready!")
             stop_all = False
+            ood_current_series = []
+            ood_pred_series = []
             while True:
                 ood_frames = []
-                ood_current_series = []
-                ood_pred_series = []
                 try:
                     policy.reset()
                     start_delay = 1.0
@@ -517,6 +596,7 @@ def main(
                     iter_idx = 0
                     perv_target_pose = None
                     paused = False
+                    last_pred_score = None
                     while True:
                         key = key_reader.get_key()
                         if key == "s":
@@ -544,7 +624,7 @@ def main(
                             time.sleep(0.05)
                             continue
 
-                        t_cycle_end = t_start + (iter_idx + steps_per_inference) * dt
+                        t_cycle_end = t_start + (iter_idx + 1) * dt
 
                         if debug_timing:
                             print(f"[TIMING] before_get_obs t={time.time():.3f}")
@@ -558,7 +638,6 @@ def main(
                         with torch.no_grad():
                             if debug_timing:
                                 print(f"[TIMING] before_policy_infer t={time.time():.3f}")
-                            s = time.time()
                             if use_repr_obs_dict:
                                 obs_dict_np = get_real_relative_obs_dict(
                                     env_obs=obs,
@@ -571,84 +650,96 @@ def main(
                                 obs_dict_np = get_real_obs_dict(env_obs=obs, shape_meta=cfg.task.shape_meta)
                             _validate_obs_dict_np(obs_dict_np, cfg.task.shape_meta)
                             obs_dict = dict_apply(obs_dict_np, lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
-                            result = policy.predict_action(obs_dict)
-                            action = result["action"][0].detach().to("cpu").numpy()
-                            action = get_real_relative_action(
-                                action,
-                                obs,
-                                action_pose_repr,
-                                action_gripper_repr,
-                                rot_quat2mat,
-                                rot_6d2mat,
-                                rot_mat2target,
-                            )
-                            print("Inference latency:", time.time() - s)
-                            if debug_timing:
-                                print(f"[TIMING] after_policy_infer t={time.time():.3f}")
+                            should_run_inference = (iter_idx % steps_per_inference) == 0
+                            result = None
+                            action = None
+                            if should_run_inference:
+                                s = time.time()
+                                result = policy.predict_action(obs_dict)
+                                action = result["action"][0].detach().to("cpu").numpy()
+                                action = get_real_relative_action(
+                                    action,
+                                    obs,
+                                    action_pose_repr,
+                                    action_gripper_repr,
+                                    rot_quat2mat,
+                                    rot_6d2mat,
+                                    rot_mat2target,
+                                )
+                                print("Inference latency:", time.time() - s)
+                                if debug_timing:
+                                    print(f"[TIMING] after_policy_infer t={time.time():.3f}")
 
                             if ood_monitor is not None:
                                 current_metrics = ood_monitor.score_current(obs_dict)
                                 predicted_metrics = None
-                                if predicted_ood_supported:
+                                if predicted_ood_supported and result is not None:
                                     last_obs = _get_last_step_obs(obs_dict)
                                     predicted_metrics = ood_monitor.score_predicted(last_obs, result["action"])
 
                                 ood_current_series.append(current_metrics["normalized"])
-                                pred_score = None
+                                pred_score = last_pred_score
                                 if predicted_metrics is not None:
                                     pred_score = predicted_metrics["normalized"]
+                                    last_pred_score = pred_score
+                                    ood_pred_series.append(pred_score)
+                                elif pred_score is not None and predicted_ood_supported:
                                     ood_pred_series.append(pred_score)
 
-                                vis_frame = _render_ood_panel(
+                                vis_frame = _render_ood_dashboard(
                                     frame_bgr=_normalize_vis_image(obs[vis_rgb_key][-1])[..., ::-1].copy(),
-                                    current_series=ood_current_series[-ood_plot_window:],
-                                    predicted_series=ood_pred_series[-ood_plot_window:],
+                                    current_series=ood_current_series,
+                                    predicted_series=ood_pred_series,
                                     current_score=current_metrics["normalized"],
                                     predicted_score=pred_score,
-                                    threshold=ood_monitor.threshold_normalized,
-                                    mode="policy",
+                                    recent_window=ood_plot_window,
                                 )
-                                cv2.imshow("rb10_ood", vis_frame)
+                                _show_dashboard_window("rb10_ood", vis_frame)
                                 cv2.waitKey(1)
                                 if (iter_idx % max(1, ood_vis_every)) == 0:
-                                    ood_frames.append(vis_frame.copy())
+                                    wrist_frame = _normalize_vis_image(obs[wrist_rgb_key][-1])[..., ::-1].copy()
+                                    ood_frames.append(_compose_ood_recording_frame(wrist_frame, vis_frame))
                             else:
-                                cv2.imshow("rb10_eval", _normalize_vis_image(obs[vis_rgb_key][-1])[..., ::-1])
+                                _show_dashboard_window(
+                                    "rb10_eval",
+                                    _normalize_vis_image(obs[vis_rgb_key][-1])[..., ::-1],
+                                )
                                 cv2.waitKey(1)
 
-                        if delta_action:
-                            assert len(action) == 1
-                            if perv_target_pose is None:
-                                perv_target_pose = obs["robot_eef_pose"][-1]
-                            this_target_pose = perv_target_pose.copy()
-                            this_target_pose[[0, 1]] += action[-1]
-                            perv_target_pose = this_target_pose
-                            this_target_poses = np.expand_dims(this_target_pose, axis=0)
-                        else:
-                            this_target_poses = np.zeros((len(action), action.shape[-1]), dtype=np.float64)
-                            this_target_poses[:, : action.shape[-1]] = action
+                        if result is not None:
+                            if delta_action:
+                                assert len(action) == 1
+                                if perv_target_pose is None:
+                                    perv_target_pose = obs["robot_eef_pose"][-1]
+                                this_target_pose = perv_target_pose.copy()
+                                this_target_pose[[0, 1]] += action[-1]
+                                perv_target_pose = this_target_pose
+                                this_target_poses = np.expand_dims(this_target_pose, axis=0)
+                            else:
+                                this_target_poses = np.zeros((len(action), action.shape[-1]), dtype=np.float64)
+                                this_target_poses[:, : action.shape[-1]] = action
 
-                        action_timestamps = (np.arange(len(action), dtype=np.float64) + action_offset) * dt + obs_timestamps[-1]
-                        action_exec_latency = 0.01
-                        curr_time = time.time()
-                        is_new = action_timestamps > (curr_time + action_exec_latency)
+                            action_timestamps = (np.arange(len(action), dtype=np.float64) + action_offset) * dt + obs_timestamps[-1]
+                            action_exec_latency = 0.01
+                            curr_time = time.time()
+                            is_new = action_timestamps > (curr_time + action_exec_latency)
 
-                        if np.sum(is_new) == 0:
-                            this_target_poses = this_target_poses[[-1]]
-                            next_step_idx = int(np.ceil((curr_time - eval_t_start) / dt))
-                            action_timestamp = eval_t_start + next_step_idx * dt
-                            print("Over budget", action_timestamp - curr_time)
-                            action_timestamps = np.array([action_timestamp])
-                        else:
-                            this_target_poses = this_target_poses[is_new]
-                            action_timestamps = action_timestamps[is_new]
+                            if np.sum(is_new) == 0:
+                                this_target_poses = this_target_poses[[-1]]
+                                next_step_idx = int(np.ceil((curr_time - eval_t_start) / dt))
+                                action_timestamp = eval_t_start + next_step_idx * dt
+                                print("Over budget", action_timestamp - curr_time)
+                                action_timestamps = np.array([action_timestamp])
+                            else:
+                                this_target_poses = this_target_poses[is_new]
+                                action_timestamps = action_timestamps[is_new]
 
-                        if debug_timing:
-                            print(f"[TIMING] before_exec_actions t={time.time():.3f}")
-                        env.exec_actions(actions=this_target_poses, timestamps=action_timestamps)
-                        if debug_timing:
-                            print(f"[TIMING] after_exec_actions t={time.time():.3f}")
-                        print(f"Submitted {len(this_target_poses)} steps of actions.")
+                            if debug_timing:
+                                print(f"[TIMING] before_exec_actions t={time.time():.3f}")
+                            env.exec_actions(actions=this_target_poses, timestamps=action_timestamps)
+                            if debug_timing:
+                                print(f"[TIMING] after_exec_actions t={time.time():.3f}")
+                            print(f"Submitted {len(this_target_poses)} steps of actions.")
 
                         terminate = False
                         if time.monotonic() - t_start > max_duration:
@@ -668,7 +759,7 @@ def main(
                         precise_wait(t_cycle_end - frame_latency)
                         if debug_timing:
                             print(f"[TIMING] after_wait t={time.time():.3f}")
-                        iter_idx += steps_per_inference
+                        iter_idx += 1
                     if stop_all:
                         break
 
