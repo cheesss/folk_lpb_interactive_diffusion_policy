@@ -1,0 +1,44 @@
+name: son_pick_and_place_tissue_image_ood_relative
+
+expert_dataset_path: /media/son/son_dataset_2/IL/dataset/rb10_pick_and_place/pick_tissue_all.hdf5
+rollout_dataset_paths: []
+
+shape_meta: &shape_meta
+  obs:
+    image0:
+      shape: [3, 240, 320]
+      type: rgb
+    image1:
+      shape: [3, 240, 320]
+      type: rgb
+    position:
+      shape: [3]
+      type: low_dim
+    quat:
+      raw_shape: [4]
+      shape: [6]
+      type: low_dim
+      rotation_rep: rotation_6d
+    gripper:
+      shape: [1]
+      type: low_dim
+  action:
+    shape: [10]
+    rotation_rep: rotation_6d
+
+pose_repr: &pose_repr
+  obs_pose_repr: abs
+  action_pose_repr: relative
+  action_gripper_repr: abs
+
+dataset:
+  _target_: diffusion_policy.dataset.son_replay_ood_dynamics_dataset_relative.SonReplayOODDynamicsDatasetRelative
+  shape_meta: *shape_meta
+  expert_dataset_path: ${task.expert_dataset_path}
+  rollout_dataset_paths: ${task.rollout_dataset_paths}
+  action_horizon: ${action_horizon}
+  seed: 42
+  val_ratio: 0.1
+  rotation_rep: rotation_6d
+  use_cache: False
+  pose_repr: *pose_repr

@@ -1,5 +1,6 @@
-from typing import Dict
+from typing import Dict, Optional
 import math
+import hydra
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -172,11 +173,104 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
         self.num_inference_steps = num_inference_steps
+        self.planner = None
+        self.guidance_scale = 0.0
+        self.guidance_num_steps = 0
+        self.guidance_threshold = None
+        self.correct_num = 0
 
         print("Diffusion params: %e" % sum(p.numel() for p in self.model.parameters()))
         print("Vision params: %e" % sum(p.numel() for p in self.obs_encoder.parameters()))
     
+    def initialize_planner(
+            self,
+            planner_target: str,
+            bank_path: str,
+            dynamics_model_ckpt: Optional[str],
+            threshold: Optional[float],
+            guidance_scale: float,
+            guidance_num_steps: int,
+            chunk_size: int = 4096,
+            device: Optional[str] = None,
+            action_horizon: Optional[int] = None,
+            action_start_idx: Optional[int] = None,
+            expected_shape_meta: Optional[dict] = None,
+            demo_dataset_path: Optional[str] = None):
+        planner_cls = hydra.utils.get_class(planner_target)
+        planner_device = device or str(self.device)
+        self.planner = planner_cls(
+            policy=self,
+            bank_path=bank_path,
+            dynamics_ckpt=dynamics_model_ckpt,
+            expected_shape_meta=expected_shape_meta,
+            threshold=threshold,
+            device=planner_device,
+            chunk_size=chunk_size,
+            action_horizon=action_horizon,
+            action_start_idx=action_start_idx,
+            demo_dataset_path=demo_dataset_path,
+        )
+        self.guidance_scale = float(guidance_scale)
+        self.guidance_num_steps = int(guidance_num_steps)
+        self.guidance_threshold = float(self.planner.threshold)
+
     # ========= inference  ============
+    def guided_conditional_sample(
+            self,
+            condition_data,
+            condition_mask,
+            local_cond=None,
+            global_cond=None,
+            generator=None,
+            classifier_guidance=False,
+            current_obs=None,
+            **kwargs):
+        model = self.model
+        scheduler = self.noise_scheduler
+
+        trajectory = torch.randn(
+            size=condition_data.shape,
+            dtype=condition_data.dtype,
+            device=condition_data.device,
+            generator=generator)
+
+        scheduler.set_timesteps(self.num_inference_steps)
+
+        current_cost = None
+        if classifier_guidance and self.planner is not None and current_obs is not None:
+            current_cost = (-self.planner.compute_current_reward(current_obs)).mean()
+            if current_cost.item() >= self.guidance_threshold:
+                self.correct_num += 1
+
+        total_steps = len(scheduler.timesteps)
+        for step_idx, t in enumerate(scheduler.timesteps):
+            trajectory[condition_mask] = condition_data[condition_mask]
+            trajectory = trajectory.detach().requires_grad_(True)
+
+            model_output = model(
+                trajectory, t, local_cond=local_cond, global_cond=global_cond)
+
+            should_guide = (
+                classifier_guidance
+                and self.planner is not None
+                and current_obs is not None
+                and current_cost is not None
+                and current_cost.item() > self.guidance_threshold
+                and step_idx >= max(0, total_steps - self.guidance_num_steps)
+            )
+            if should_guide:
+                trajectory0 = scheduler.step(model_output, t, trajectory).pred_original_sample
+                loss = self.planner.compute_loss(trajectory0, current_obs)
+                cond_grad = -torch.autograd.grad(loss, trajectory, retain_graph=False)[0]
+                grad_scale = self.guidance_scale * (1 - scheduler.alphas_cumprod[t]).sqrt()
+                trajectory = trajectory.detach() + grad_scale * cond_grad
+
+            trajectory = scheduler.step(
+                model_output, t, trajectory, generator=generator, **kwargs).prev_sample
+
+        trajectory[condition_mask] = condition_data[condition_mask]
+        return trajectory
+
     def conditional_sample(self, 
             condition_data, condition_mask,
             local_cond=None, global_cond=None,
@@ -217,7 +311,11 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
         return trajectory
 
 
-    def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def predict_action(
+            self,
+            obs_dict: Dict[str, torch.Tensor],
+            use_lpb_guidance: Optional[bool] = None,
+            current_obs: Optional[Dict[str, torch.Tensor]] = None) -> Dict[str, torch.Tensor]:
         """
         obs_dict: must include "obs" key
         result: must include "action" key
@@ -259,13 +357,28 @@ class DiffusionUnetHybridImagePolicy(BaseImagePolicy):
             cond_data[:,:To,Da:] = nobs_features
             cond_mask[:,:To,Da:] = True
 
-        # run sampling
-        nsample = self.conditional_sample(
-            cond_data, 
-            cond_mask,
-            local_cond=local_cond,
-            global_cond=global_cond,
-            **self.kwargs)
+        should_use_guidance = (
+            self.planner is not None if use_lpb_guidance is None else bool(use_lpb_guidance)
+        )
+        planning_obs = current_obs if current_obs is not None else obs_dict
+        if should_use_guidance:
+            with torch.enable_grad():
+                nsample = self.guided_conditional_sample(
+                    cond_data,
+                    cond_mask,
+                    local_cond=local_cond,
+                    global_cond=global_cond,
+                    classifier_guidance=True,
+                    current_obs=planning_obs,
+                    **self.kwargs,
+                )
+        else:
+            nsample = self.conditional_sample(
+                cond_data, 
+                cond_mask,
+                local_cond=local_cond,
+                global_cond=global_cond,
+                **self.kwargs)
         
         # unnormalize prediction
         naction_pred = nsample[...,:Da]

@@ -40,6 +40,22 @@ from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
+LPB_DEFAULT_PRESETS = {
+    "pusht": {"guidance_scale": 0.05, "threshold": 3.2, "guidance_num_steps": 10},
+    "square": {"guidance_scale": 0.05, "threshold": 5.0, "guidance_num_steps": 10},
+    "tool_hang": {"guidance_scale": 0.05, "threshold": 1.4, "guidance_num_steps": 10},
+    "transport": {"guidance_scale": 0.2, "threshold": 2.8, "guidance_num_steps": 10},
+    "libero": {"guidance_scale": 0.2, "threshold": 1.1, "guidance_num_steps": 10},
+    # Real-robot default: paper uses 16-step DDIM with guidance over the final five steps.
+    "real_robot_default": {"guidance_scale": 0.05, "threshold": None, "guidance_num_steps": 5},
+    "son_pick_and_place_image": {"guidance_scale": 0.05, "threshold": None, "guidance_num_steps": 5},
+    "son_pick_and_place_tissue_image_relative": {
+        "guidance_scale": 0.05,
+        "threshold": None,
+        "guidance_num_steps": 5,
+    },
+}
+
 
 def _get_last_step_obs(obs_dict):
     return dict_apply(obs_dict, lambda x: x[:, -1])
@@ -107,6 +123,18 @@ def _get_pose_repr_cfg(task_cfg):
     if isinstance(pose_repr_cfg, dict):
         return pose_repr_cfg
     return {}
+
+
+def _resolve_lpb_defaults(task_name: str):
+    normalized = (task_name or "").lower()
+    if normalized in LPB_DEFAULT_PRESETS:
+        return LPB_DEFAULT_PRESETS[normalized]
+    for key, preset in LPB_DEFAULT_PRESETS.items():
+        if key == "real_robot_default":
+            continue
+        if key in normalized:
+            return preset
+    return LPB_DEFAULT_PRESETS["real_robot_default"]
 
 
 def _validate_obs_dict_np(obs_dict_np, shape_meta):
@@ -415,6 +443,11 @@ def _save_ood_video_if_needed(output_dir, episode_idx, frames_bgr, fps):
 @click.option("--ood_vis_every", default=1, type=int, help="Save OOD frames every N loops")
 @click.option("--ood_plot_window", default=120, type=int, help="Number of recent OOD points to plot")
 @click.option("--ood_chunk_size", default=4096, type=int, help="Chunk size for kNN OOD distance")
+@click.option("--steer/--no-steer", default=True, help="Enable LPB steering during policy denoising.")
+@click.option("--planner_target", default="diffusion_policy.policy.lpb_original_planner.LPBOriginalPlanner", help="Planner class used for LPB guidance.")
+@click.option("--guidance_scale", default=None, type=float, help="LPB guidance scale override.")
+@click.option("--guidance_num_steps", default=None, type=int, help="Number of final denoising steps that receive LPB guidance.")
+@click.option("--lpb_demo_dataset", default=None, help="Expert demonstration dataset path for original-style LPB planner.")
 @click.option("--debug_timing", is_flag=True, default=False, help="Print timing markers for debugging")
 def main(
     input,
@@ -434,6 +467,11 @@ def main(
     ood_vis_every,
     ood_plot_window,
     ood_chunk_size,
+    steer,
+    planner_target,
+    guidance_scale,
+    guidance_num_steps,
+    lpb_demo_dataset,
     debug_timing,
 ):
     ckpt_path = input
@@ -483,13 +521,37 @@ def main(
             )
         rot_mat2target["action"] = RotationTransformer("matrix", action_rotation_rep)
 
-    predicted_ood_supported = (obs_pose_repr == "abs" and action_pose_repr == "abs")
-    if oodf is not None and not predicted_ood_supported:
-        print(
-            "[OOD] Relative pose/action checkpoint detected. "
-            "Predicted OOD is disabled for now; current OOD visualization will still run."
+    preset = _resolve_lpb_defaults(cfg.task.name)
+    if guidance_scale is None:
+        guidance_scale = preset["guidance_scale"]
+    if guidance_num_steps is None:
+        guidance_num_steps = preset["guidance_num_steps"]
+    if ood_threshold is None and preset["threshold"] is not None:
+        ood_threshold = preset["threshold"]
+
+    planner_allows_no_bank = "lpb_original_planner" in planner_target.lower()
+    steering_ready = bool(
+        steer and oodf is not None and (ood_bank is not None or planner_allows_no_bank)
+    )
+    if steering_ready:
+        policy.initialize_planner(
+            planner_target=planner_target,
+            bank_path=ood_bank,
+            dynamics_model_ckpt=oodf,
+            threshold=ood_threshold,
+            guidance_scale=guidance_scale,
+            guidance_num_steps=guidance_num_steps,
+            chunk_size=ood_chunk_size,
+            device=str(device),
+            action_horizon=steps_per_inference,
+            expected_shape_meta=cfg.task.shape_meta,
+            demo_dataset_path=lpb_demo_dataset or cfg.task.get("dataset_path", None),
         )
-        oodf = None
+        print(
+            "[LPB] steering enabled with "
+            f"guidance_scale={guidance_scale}, guidance_num_steps={guidance_num_steps}, "
+            f"threshold={'bank_p95' if ood_threshold is None else ood_threshold}"
+        )
 
     ood_monitor = None
     if ood_bank is not None:
@@ -502,6 +564,9 @@ def main(
             device=str(device),
             chunk_size=ood_chunk_size,
         )
+    predicted_ood_supported = (
+        ood_monitor is not None and getattr(ood_monitor, "dynamics_model", None) is not None
+    )
 
     dt = 1 / frequency
     obs_res = get_real_obs_resolution(cfg.task.shape_meta)
@@ -557,7 +622,11 @@ def main(
                     obs_dict_np = get_real_obs_dict(env_obs=obs, shape_meta=cfg.task.shape_meta)
                 _validate_obs_dict_np(obs_dict_np, cfg.task.shape_meta)
                 obs_dict = dict_apply(obs_dict_np, lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
-                result = policy.predict_action(obs_dict)
+                result = policy.predict_action(
+                    obs_dict,
+                    use_lpb_guidance=steering_ready,
+                    current_obs=obs_dict,
+                )
                 action = result["action"][0].detach().to("cpu").numpy()
                 action = get_real_relative_action(
                     action,
@@ -655,7 +724,11 @@ def main(
                             action = None
                             if should_run_inference:
                                 s = time.time()
-                                result = policy.predict_action(obs_dict)
+                                result = policy.predict_action(
+                                    obs_dict,
+                                    use_lpb_guidance=steering_ready,
+                                    current_obs=obs_dict,
+                                )
                                 action = result["action"][0].detach().to("cpu").numpy()
                                 action = get_real_relative_action(
                                     action,

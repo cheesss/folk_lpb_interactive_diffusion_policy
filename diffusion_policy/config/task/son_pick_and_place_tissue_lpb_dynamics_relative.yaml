@@ -1,0 +1,49 @@
+name: son_pick_and_place_tissue_lpb_dynamics_relative
+
+dataset_path: /media/son/son_dataset_2/IL/dataset/rb10_pick_and_place/pick_tissue_all.hdf5
+view_names: &view_names [image0, image1]
+lowdim_keys: &lowdim_keys [position, quat, gripper]
+original_action_dim: &original_action_dim 10
+proprio_dim: &proprio_dim 10
+original_img_size: &original_img_size 320
+cropped_img_size: &cropped_img_size 288
+
+shape_meta: &shape_meta
+  obs:
+    image0:
+      shape: [3, 240, 320]
+      type: rgb
+    image1:
+      shape: [3, 240, 320]
+      type: rgb
+    position:
+      shape: [3]
+      type: low_dim
+    quat:
+      raw_shape: [4]
+      shape: [6]
+      type: low_dim
+      rotation_rep: rotation_6d
+    gripper:
+      shape: [1]
+      type: low_dim
+  action:
+    shape: [10]
+    rotation_rep: rotation_6d
+
+pose_repr: &pose_repr
+  obs_pose_repr: abs
+  action_pose_repr: relative
+  action_gripper_repr: abs
+
+dataset:
+  _target_: diffusion_policy.dataset.son_lpb_dynamics_dataset_relative.SonLPBDynamicsDatasetRelative
+  dataset_path: ${task.dataset_path}
+  shape_meta: *shape_meta
+  num_hist: ${num_hist}
+  num_pred: ${num_pred}
+  frameskip: ${frameskip}
+  view_names: *view_names
+  original_img_size: *original_img_size
+  cropped_img_size: *cropped_img_size
+  pose_repr: *pose_repr
